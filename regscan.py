@@ -9,7 +9,7 @@ import volatility.obj as obj
 import volatility.plugins.common as common # 플러그인 커맨드 처리, window
 import volatility.utils as utils
 import volatility.constants as constants
-import volatility.win32.tasks as tasks
+import volatility.win32.tasks as tasks # 이건 프로세스 목록 얻어오는 용도?여서 안쓸 듯.
 import volatility.debug as debug
 
 try:
@@ -18,13 +18,23 @@ try:
 except ImportError:
     has_yara = False
 
+try:
+    import distorm3
+    has_distorm3 = True
+except ImportError:
+    has_distorm3 = False
+
 #TODO--------------------+
 # Registry value parsing
 #------------------------+
 
-# 레지스트리의 value들을 전부 가져와서 list에 저장한 후,
+# 레지스트리의 value들을 전부 가져오고, key path와 value를 dict로 저장!
 # RegYaraScanner로 던지면,
 # 실행 코드 탐색(...)
+
+class RegList(hivelist.HiveList):
+
+
 
 #TODO--------------------+
 # yara scan

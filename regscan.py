@@ -4,139 +4,228 @@
 @E-mail : rhdqor100@live.co.kr
 @Description : Volatility plug-in that scans the registry from the memory dump to find malware.
 """
-import volatility.plugins.registry.registryapi as registryapi # 레지스트리 API 사용, 메모리 덤프내 레지스트리 처리
-import volatility.plugins.registry.hivelist as hl
 import volatility.obj as obj
-import volatility.plugins.common as common # 플러그인 커맨드 처리, window
-import volatility.utils as utils
-import volatility.constants as constants
 import volatility.win32.hive as hivemod
-import volatility.win32.tasks as tasks # 이건 프로세스 목록 얻어오는 용도?여서 안쓸 듯.
+import volatility.win32.rawreg as rawreg
 import volatility.debug as debug
+import volatility.utils as utils
+import volatility.commands as commands
+import volatility.plugins.common as common
+import volatility.plugins.registry.hivelist as hivelist
+import volatility.plugins.registry.printkey as printkey
+import volatility.plugins.registry.registryapi as registryapi
+from volatility.renderers import TreeGrid
+from volatility.renderers.basic import Address, Bytes
 
-try:
-    import yara
-    has_yara = True
-except ImportError:
-    has_yara = False
+def vol(k):
+    return bool(k.obj_offset & 0x80000000)
 
-try:
-    import distorm3
-    has_distorm3 = True
-except ImportError:
-    has_distorm3 = False
-
-#TODO--------------------+
-# Registry value parsing
-#------------------------+
-
-# 레지스트리의 value들을 전부 가져오고, key path와 value를 dict로 저장!
-# RegYaraScanner로 던지면,
-# 실행 코드 탐색(...)
-
-# Hivelist를 플러그인 메인으로 부터 전달 받음
-# printkey 플러그인은 특정 레지 키의 서브키, 밸류, 데이터를 보여주는 명령어
-# 모든 hives로 부터 검색을 하여 찾아진 key information을 출력
-
-
-
-#TODO--------------------+
-# yara scan
-#------------------------+
-
-class BaseYaraScanner(object):
-
-    overlap = 1024
-
-    def __init__(self, address_space = None, rules = None ):
-        self.rules = rules
-        self.address_space = address_space
-
-    def scan(self, offset, maxlen):
-        # Start scanning from offset until maxlen:
-        i = offset
-
-        if isinstance(self.rules, list):
-            rules = self.rules
-        else:
-            rules = [self.rules]
-
-        while i < offset + maxlen:
-            # Read some data and match it.
-            to_read = min(constants.SCAN_BLOCKSIZE + self.overlap, offset + maxlen -i)
-            data = self.address_space.zread(i, to_read)
-            if data:
-                for rule in rules:
-                    for match in rule.match(data = data):
-                        for moffset, _name, _value in match.strings:
-                            if moffset < constants.SCAN_BLOCKSIZE:
-                                yield match, moffset + i
-
-            i += constants.SCAN_BLOCKSIZE
-
-class RegYaraScanner(BaseYaraScanner):
-
-    def __init__(self):
-        BaseYaraScanner.__init__()
-
-    def scan(self):
-        pass
-        #registry yara scan
-        #for value, self.address_space in ~
-            #for match in BaseYaraScanner.scan(self, ~):
-                #yield match
-
-#----------------------+
-# RegScan Plugin class |
-#----------------------+
-
-class RegScan(common.AbstractWindowsCommand):
-    Malware_preferred_registry = []
+class RegScan(printkey.PrintKey):
 
     def __init__(self, config, *args, **kwargs):
-        common.AbstractWindowsCommand.__init__(self, config, *args, **kwargs)
-
+        hivelist.HiveList.__init__(self, config, *args, **kwargs)
         config.add_option('HIVE-OFFSET', short_option = 'o',
-                          help = 'Hive offset (virtual)', type ='int')
-        config.add_option('KEY', short_option= 'K',
-                          help= 'Registry Key', type='str')
+                          help = 'Hive offset (virtual)', type = 'int')
+        config.add_option('KEY', short_option = 'K',
+                          help = 'Registry Key', type = 'str')
 
     def calculate(self):
-        hivelists = []
-        # 메모리 이미지 물리 주소 영역 호출, 물리 주소 영역의 base 주소 return
-        addr_space = utils.load_as(self._config, astype='physical')
+        addr_space = utils.load_as(self._config)
         regapi = registryapi.RegistryApi(self._config)
+        hiveset = set()
 
-        # hive 전체 리스트를 얻어 온다. 어떻게?
-        regapi.populate_offsets()
-        print "[debug] debug message"
-        tmp = regapi.print_offsets()
-        print "[debug:type]", type(tmp)
-        tmp = str(tmp).split('\n')
-        print "[debug:list]", tmp
-        for hive_offset in tmp:
-            if hive_offset == None:
-                continue
+        if not self._config.HIVE_OFFSET:
+            hive_offsets = [h.obj_offset for h in hivelist.HiveList.calculate(self)]
+        else:
+            hive_offsets = [self._config.HIVE_OFFSET]
+
+        for hoff in set(hive_offsets):
+            h = hivemod.HiveAddressSpace(addr_space, self._config, hoff)
+            name = obj.Object("_CMHIVE", vm=addr_space, offset=hoff).get_name()
+            print "[debug]", name
+            root = rawreg.get_root(h)
+            hive = name.split("\\")[-1]
+            hiveset.add(hive)
+
+        print hiveset
+        for hive in hiveset:
+            print "\n========================", hive
+
+            for regtime, keyname in regapi.reg_get_last_modified(hive, count = 5):
+                print "\n", regtime, keyname
+                regapi.set_current(hive_name=hive)
+                k = keyname.split('\\')[1:]
+                k = '\\'.join(k)
+                print k + "\n"
+                for value, tp, data in self.reg_yield_values_type(regapi, hive_name = hive, key = k):
+                    yield value, tp, data
+
+            regapi.reset_current()
+
+    def reg_yield_values_type(self, regapi, hive_name, key, thetype = None, given_root = None, raw = False):
+
+        if key or given_root:
+            h = given_root if given_root != None else regapi.reg_get_key(hive_name, key)
+            if h != None:
+                for v in rawreg.values(h):
+                    tp, dat = rawreg.value_data(v)
+                    if thetype == None or tp == thetype:
+                        if raw:
+                            yield v, tp, dat
+                        else:
+                            yield v.Name, tp, dat
+
+        #keylist = [k for k in printkey.PrintKey.calculate(self)]
+        #for n, rk in keylist:
+        #    print "[+]", n, rk.Name
+        #s    self.search_key(rk, "")
+
+
+    def search_key(self, key, prefix):
+        prefix += '\t'
+        for subkey in rawreg.subkeys(key):
+
+            if not rawreg.values(subkey):
+                if not rawreg.subkeys(subkey):
+                    print "[-]", subkey.Name
+                    continue
+                else:
+                    pass
+
+            if subkey.Name == None:
+                pass
             else:
-                hive_offset = hive_offset.split(' ')[-1]
-                hivelists.append(hive_offset)
+                print prefix, subkey.Name
+                self.search_key(subkey, prefix)
 
-        print "[debug]",hivelists
+            """
+            for v in rawreg.values(subkey):
+                tp, dat = rawreg.value_data(v)
+                if tp == 'REG_BINARY':
+                    print dat
+            """
 
-        # 각각의 하이브에 대해서 스캔을 수행한다.
-        # 하이브에서 가장 최근에 수정된 레지스트리 키를 얻어 온다.
+    def voltext(self, key):
+        return "(V)" if vol(key) else "(S)"
 
-        for hive in hivelists:
-            for regtime, regname, keyname, in regapi.reg_get_last_modified(hive, count = 25):
-                # 여기서 얻어온 키네임을 통해서 value 값 얻어오기!
-                val = regapi.reg_get_value(self, hive, keyname, keyname.split("\\")[-1])
-                yield val
-
-
-
-
-    # data는 calculate에서 리턴된 값의 인자. generater 타입으로 리턴하기 때문에 for문이 필수
     def render_text(self, outfd, data):
-        # 찾은 레지스트리 key, value, (disassembly?)
-        for proc in data:
-            outfd.write("{0:s} \n".format(proc))
+
+        for v, tp, dat in data:
+            if tp == 'REG_BINARY' or tp == 'REG_NONE':
+                dat = "\n" + "\n".join(
+                    ["{0:#010x}  {1:<48}  {2}".format(o, h, ''.join(c)) for o, h, c in utils.Hexdump(dat)])
+            if tp in ['REG_SZ', 'REG_EXPAND_SZ', 'REG_LINK']:
+                dat = dat.encode("ascii", 'backslashreplace')
+            if tp == 'REG_MULTI_SZ':
+                for i in range(len(dat)):
+                    dat[i] = dat[i].encode("ascii", 'backslashreplace')
+            outfd.write("{0:13} {1:15} : {2} \n".format(tp, v, dat))
+
+        """
+        outfd.write("Legend: (S) = Stable   (V) = Volatile\n\n")
+        keyfound = False
+        for reg, key in data:
+            if key:
+                keyfound = True
+                outfd.write("----------------------------\n")
+                outfd.write("Registry: {0}\n".format(reg))
+                outfd.write("Key name: {0} {1:3s}\n".format(key.Name, self.voltext(key)))
+                outfd.write("Last updated: {0}\n".format(key.LastWriteTime))
+                outfd.write("\n")
+                outfd.write("Subkeys:\n")
+                for s in rawreg.subkeys(key):
+                    if s.Name == None:
+                        outfd.write("  Unknown subkey: " + s.Name.reason + "\n")
+                    else:
+                        outfd.write("  {1:3s} {0}\n".format(s.Name, self.voltext(s)))
+                outfd.write("\n")
+                outfd.write("Values:\n")
+                for v in rawreg.values(key):
+                    tp, dat = rawreg.value_data(v)
+                    if tp == 'REG_BINARY' or tp == 'REG_NONE':
+                        dat = "\n" + "\n".join(["{0:#010x}  {1:<48}  {2}".format(o, h, ''.join(c)) for o, h, c in utils.Hexdump(dat)])
+                    if tp in ['REG_SZ', 'REG_EXPAND_SZ', 'REG_LINK']:
+                        dat = dat.encode("ascii", 'backslashreplace')
+                    if tp == 'REG_MULTI_SZ':
+                        for i in range(len(dat)):
+                            dat[i] = dat[i].encode("ascii", 'backslashreplace')
+                    outfd.write("{0:13} {1:15} : {3:3s} {2}\n".format(tp, v.Name, dat, self.voltext(v)))
+        if not keyfound:
+            outfd.write("The requested key could not be found in the hive(s) searched\n")
+        """
+"""
+    def unified_output(self, data):
+        return TreeGrid([("Registry", str),
+                       ("KeyName", str),
+                       ("KeyStability", str),
+                       ("LastWrite", str),
+                       ("Subkeys", str),
+                       ("SubkeyStability", str),
+                       ("ValType", str),
+                       ("ValName", str),
+                       ("ValStability", str),
+                       ("ValData", str)],
+                        self.generator(data))
+
+    def generator(self, data):
+        for reg, key in data:
+            if key:
+                subkeys = list(rawreg.subkeys(key))
+                values = list(rawreg.values(key))
+                yield (0, [str("{0}".format(reg)),
+                        str("{0}".format(key.Name)),
+                        str("{0:3s}".format(self.voltext(key))),
+                        str("{0}".format(key.LastWriteTime)),
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "-"])
+
+                if subkeys:
+                    for s in subkeys:
+                        if s.Name == None:
+                            yield (0, [str("{0}".format(reg)),
+                                str("{0}".format(key.Name)),
+                                str("{0:3s}".format(self.voltext(key))),
+                                str("{0}".format(key.LastWriteTime)),
+                                str("Unknown subkey: {0}".format(s.Name.reason)),
+                                "-",
+                                "-",
+                                "-",
+                                "-",
+                                "-"])
+                        else:
+                            yield (0, [str("{0}".format(reg)),
+                                str("{0}".format(key.Name)),
+                                str("{0:3s}".format(self.voltext(key))),
+                                str("{0}".format(key.LastWriteTime)),
+                                str("{0}".format(s.Name)),
+                                str("{0:3s}".format(self.voltext(s))),
+                                "-",
+                                "-",
+                                "-",
+                                "-"])
+
+                if values:
+                    for v in values:
+                        tp, dat = rawreg.value_data(v)
+                        if tp == 'REG_BINARY' or tp == 'REG_NONE':
+                            dat = Bytes(dat)
+                        if tp in ['REG_SZ', 'REG_EXPAND_SZ', 'REG_LINK']:
+                            dat = dat.encode("ascii", 'backslashreplace')
+                        if tp == 'REG_MULTI_SZ':
+                            for i in range(len(dat)):
+                                dat[i] = dat[i].encode("ascii", 'backslashreplace')
+                        yield (0, [str("{0}".format(reg)),
+                            str("{0}".format(key.Name)),
+                            str("{0:3s}".format(self.voltext(key))),
+                            str("{0}".format(key.LastWriteTime)),
+                            "-",
+                            "-",
+                            str(tp),
+                            str("{0}".format(v.Name)),
+                            str("{0:3s}".format(self.voltext(v))),
+                            str(dat)])
+"""

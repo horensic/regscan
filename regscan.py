@@ -1,7 +1,7 @@
 #-*- coding: utf-8 -*-
 """
-@Author : SeonHo Lee (IT4211)
-@E-mail : rhdqor100@live.co.kr
+@Author : SeonHo Lee (horensic)
+@E-mail : horensic@gmail.com
 @Description : Volatility plug-in that scans the registry from the memory dump to find malware.
 """
 import volatility.obj as obj
